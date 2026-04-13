@@ -3307,6 +3307,101 @@ OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 
+def _fetch_remote(git_cmd: list[str], cwd: Path, remote: str, quiet: bool = False) -> bool:
+    """Fetch a git remote, returning True on success."""
+    cmd = git_cmd + ["fetch", remote]
+    if quiet:
+        cmd.append("--quiet")
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _branch_exists(ref: str, git_cmd: list[str], cwd: Path) -> bool:
+    try:
+        result = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", f"refs/remotes/{ref}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_local_branch_tracks_remote(git_cmd: list[str], cwd: Path, branch: str, remote_ref: str) -> None:
+    local_exists = subprocess.run(
+        git_cmd + ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+    if local_exists:
+        subprocess.run(
+            git_cmd + ["checkout", branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    else:
+        subprocess.run(
+            git_cmd + ["checkout", "-b", branch, remote_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+
+def _try_push_branch(git_cmd: list[str], cwd: Path, remote: str, branch: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            git_cmd + ["push", remote, branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part).strip()
+        return result.returncode == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _git_rebase(git_cmd: list[str], cwd: Path, onto_ref: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            git_cmd + ["rebase", onto_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part).strip()
+        return result.returncode == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _abort_rebase_if_active(git_cmd: list[str], cwd: Path) -> None:
+    try:
+        git_dir = subprocess.run(
+            git_cmd + ["rev-parse", "--git-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        rebase_merge = cwd / git_dir / "rebase-merge"
+        rebase_apply = cwd / git_dir / "rebase-apply"
+        if rebase_merge.exists() or rebase_apply.exists():
+            subprocess.run(git_cmd + ["rebase", "--abort"], cwd=cwd, capture_output=True, text=True)
+    except Exception:
+        pass
+
+
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     """Get the URL of the origin remote, or None if not set."""
     try:
@@ -3417,22 +3512,18 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
 
 
 def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
-    """Check if fork is behind upstream and sync if safe.
+    """Legacy helper for `hermes update`.
 
-    This implements the fork upstream sync logic:
-    - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    Keep the original conservative behavior for `update` itself.
+    Forks with local commits ahead of upstream are left alone.
+    `update-safe` provides the stronger rebase-aware path.
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:
-        # Check if user previously declined
         if _should_skip_upstream_prompt():
             return
 
-        # Ask user if they want to add upstream
         print()
         print("ℹ Your fork is not tracking the official Hermes repository.")
         print("  This means you may miss updates from NousResearch/hermes-agent.")
@@ -3456,21 +3547,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             _mark_skip_upstream_prompt()
             return
 
-    # Fetch upstream
     print()
     print("→ Fetching upstream...")
-    try:
-        subprocess.run(
-            git_cmd + ["fetch", "upstream", "--quiet"],
-            cwd=cwd,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
+    if not _fetch_remote(git_cmd, cwd, "upstream", quiet=True):
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
         return
 
-    # Compare origin/main with upstream/main
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
     upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
 
@@ -3478,7 +3560,6 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
     if origin_ahead > 0:
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
@@ -3487,12 +3568,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("    git pull upstream main")
         return
 
-    # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
         return
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
     print()
     print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
     print("→ Pulling from upstream...")
@@ -3509,13 +3588,117 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     print("  ✓ Updated from upstream")
 
-    # Try to sync fork back to origin
     print("→ Syncing fork...")
     if _sync_fork_with_upstream(git_cmd, cwd):
         print("  ✓ Fork synced with upstream")
     else:
         print("  ℹ Got updates from upstream but couldn't push to fork (no write access?)")
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
+
+def _sync_fork_with_rebase(git_cmd: list[str], cwd: Path, branch: str = "main") -> bool:
+    """Sync a forked repo by rebasing fork main onto upstream main.
+
+    This is the safer path for customized forks:
+    - fetch origin + upstream
+    - ensure local branch exists and tracks origin/main
+    - fast-reset local branch to origin/main
+    - if upstream is ahead, rebase local branch onto upstream/main
+    - push rebased branch back to origin
+
+    Returns True when git sync completed cleanly, False when update should stop.
+    """
+    has_upstream = _has_upstream_remote(git_cmd, cwd)
+    if not has_upstream:
+        if _should_skip_upstream_prompt():
+            print("✗ Cannot run update-safe on a fork without an upstream remote.")
+            print("  Add upstream manually: git remote add upstream https://github.com/NousResearch/hermes-agent.git")
+            return False
+        print()
+        print("ℹ Your fork is not tracking the official Hermes repository.")
+        print("  update-safe needs an 'upstream' remote so it can rebase your fork cleanly.")
+        print()
+        try:
+            response = input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            response = "n"
+        if response in ("", "y", "yes"):
+            print("→ Adding upstream remote...")
+            if not _add_upstream_remote(git_cmd, cwd):
+                print("  ✗ Failed to add upstream remote.")
+                return False
+            print("  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git")
+        else:
+            print("  Skipped. update-safe cannot continue without upstream.")
+            _mark_skip_upstream_prompt()
+            return False
+
+    print("→ Fetching origin...")
+    if not _fetch_remote(git_cmd, cwd, "origin"):
+        print("✗ Failed to fetch origin.")
+        return False
+
+    print("→ Fetching upstream...")
+    if not _fetch_remote(git_cmd, cwd, "upstream"):
+        print("✗ Failed to fetch upstream.")
+        return False
+
+    if not _branch_exists(f"origin/{branch}", git_cmd, cwd):
+        print(f"✗ origin/{branch} does not exist.")
+        return False
+    if not _branch_exists(f"upstream/{branch}", git_cmd, cwd):
+        print(f"✗ upstream/{branch} does not exist.")
+        return False
+
+    try:
+        _ensure_local_branch_tracks_remote(git_cmd, cwd, branch, f"origin/{branch}")
+    except subprocess.CalledProcessError as exc:
+        print(f"✗ Failed to check out local {branch}: {exc}")
+        return False
+
+    print(f"→ Aligning local {branch} with origin/{branch}...")
+    try:
+        subprocess.run(
+            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"✗ Failed to reset local {branch} to origin/{branch}: {exc}")
+        return False
+
+    fork_ahead = _count_commits_between(git_cmd, cwd, f"upstream/{branch}", f"origin/{branch}")
+    upstream_ahead = _count_commits_between(git_cmd, cwd, f"origin/{branch}", f"upstream/{branch}")
+    if fork_ahead < 0 or upstream_ahead < 0:
+        print("✗ Could not compare origin and upstream history.")
+        return False
+
+    if upstream_ahead == 0:
+        print("✓ Fork already includes upstream changes.")
+        return True
+
+    print(f"→ Rebasing fork {branch} onto upstream/{branch}...")
+    ok, output = _git_rebase(git_cmd, cwd, f"upstream/{branch}")
+    if not ok:
+        print("✗ Rebase hit conflicts. Resolve them, then run `git rebase --continue` or `git rebase --abort`.")
+        if output:
+            print(output)
+        return False
+
+    print("→ Pushing rebased branch to origin...")
+    pushed, push_output = _try_push_branch(git_cmd, cwd, "origin", branch)
+    if not pushed:
+        print("✗ Rebase succeeded locally, but push to origin failed.")
+        if push_output:
+            print(push_output)
+        return False
+
+    total = fork_ahead + upstream_ahead
+    print(f"✓ Fork main updated and pushed ({total} combined commit(s) considered).")
+    return True
 
 
 def _invalidate_update_cache():
@@ -3622,27 +3805,27 @@ def _install_python_dependencies_with_optional_fallback(
         print(f"  ⚠ Skipped optional extras that still failed: {', '.join(failed_extras)}")
 
 
-def cmd_update(args):
-    """Update Hermes Agent to the latest version."""
+def _run_update_flow(args, *, safe_rebase_fork: bool = False):
+    """Shared implementation for `hermes update` and `hermes update-safe`."""
     import shutil
     from hermes_cli.config import is_managed, managed_error
 
+    action_name = "update Hermes Agent"
     if is_managed():
-        managed_error("update Hermes Agent")
+        managed_error(action_name)
         return
 
     gateway_mode = getattr(args, "gateway", False)
-    # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (lambda prompt, default="": _gateway_prompt(prompt, default)) if gateway_mode else None
-    
+
     print("⚕ Updating Hermes Agent...")
+    if safe_rebase_fork:
+        print("  Mode: fork-safe rebase update")
     print()
-    
-    # Try git-based update first, fall back to ZIP download on Windows
-    # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
+
     use_zip_update = False
     git_dir = PROJECT_ROOT / '.git'
-    
+
     if not git_dir.exists():
         if sys.platform == "win32":
             use_zip_update = True
@@ -3650,21 +3833,17 @@ def cmd_update(args):
             print("✗ Not a git repository. Please reinstall:")
             print("  curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash")
             sys.exit(1)
-    
-    # On Windows, git can fail with "unable to write loose object file: Invalid argument"
-    # due to filesystem atomicity issues. Set the recommended workaround.
+
     if sys.platform == "win32" and git_dir.exists():
         subprocess.run(
             ["git", "-c", "windows.appendAtomically=false", "config", "windows.appendAtomically", "false"],
             cwd=PROJECT_ROOT, check=False, capture_output=True
         )
 
-    # Build git command once — reused for fork detection and the update itself.
     git_cmd = ["git"]
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Detect if we're updating from a fork (before any branch logic)
     origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
 
@@ -3674,13 +3853,10 @@ def cmd_update(args):
         print()
 
     if use_zip_update:
-        # ZIP-based update for Windows when git is broken
         _update_via_zip(args)
         return
 
-    # Fetch and pull
     try:
-
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "origin"],
@@ -3696,12 +3872,11 @@ def cmd_update(args):
             elif "Authentication failed" in stderr or "could not read Username" in stderr:
                 print("✗ Authentication failed — check your git credentials or SSH key.")
             else:
-                print(f"✗ Failed to fetch updates from origin.")
+                print("✗ Failed to fetch updates from origin.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
-        # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=PROJECT_ROOT,
@@ -3710,102 +3885,115 @@ def cmd_update(args):
             check=True,
         )
         current_branch = result.stdout.strip()
-
-        # Always update against main
         branch = "main"
 
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
-            label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", "main"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+        auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+
+        try:
+            if safe_rebase_fork and is_fork:
+                print("→ Preparing fork-aware sync on main...")
+                _ensure_local_branch_tracks_remote(git_cmd, PROJECT_ROOT, branch, f"origin/{branch}")
+            elif current_branch != "main":
+                label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
+                print(f"  ⚠ Currently on {label} — switching to main for update...")
+                subprocess.run(
+                    git_cmd + ["checkout", "main"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            print(f"✗ Failed to prepare branch for update: {exc}")
+            if auto_stash_ref is not None:
+                print(f"  Local changes are preserved in stash: {auto_stash_ref}")
+            sys.exit(1)
 
         prompt_for_restore = auto_stash_ref is not None and (
             gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
-
-        if commit_count == 0:
-            _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd, PROJECT_ROOT, auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
-                )
-            print("✓ Already up to date!")
-            return
-
-        print(f"→ Found {commit_count} new commit(s)")
-
-        print("→ Pulling updates...")
-        update_succeeded = False
-        try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+        if safe_rebase_fork and is_fork:
+            update_succeeded = _sync_fork_with_rebase(git_cmd, PROJECT_ROOT, branch=branch)
+            if not update_succeeded:
+                print("  Update stopped before dependency refresh.")
+                if auto_stash_ref is not None:
+                    print(f"  Local changes are preserved in stash: {auto_stash_ref}")
+                sys.exit(1)
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
+                check=True,
             )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            commit_count = int(result.stdout.strip())
+
+            if commit_count == 0:
+                _invalidate_update_cache()
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd, PROJECT_ROOT, auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in ("main", "HEAD"):
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
+                    )
+                print("✓ Already up to date!")
+                return
+
+            print(f"→ Found {commit_count} new commit(s)")
+            print("→ Pulling updates...")
+            update_succeeded = False
+            try:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print("  Try manually: git fetch origin && git reset --hard origin/main")
-                    sys.exit(1)
-            update_succeeded = True
-        finally:
-            if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
-                    print(f"  Restore manually with: git stash apply")
-                else:
-                    _restore_stashed_changes(
-                        git_cmd,
-                        PROJECT_ROOT,
-                        auto_stash_ref,
-                        prompt_user=prompt_for_restore,
-                        input_fn=gw_input_fn,
+                if pull_result.returncode != 0:
+                    print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
                     )
-        
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print("  Try manually: git fetch origin && git reset --hard origin/main")
+                        sys.exit(1)
+                update_succeeded = True
+            finally:
+                if auto_stash_ref is not None:
+                    if not update_succeeded:
+                        print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+                        print("  Restore manually with: git stash apply")
+                    else:
+                        _restore_stashed_changes(
+                            git_cmd,
+                            PROJECT_ROOT,
+                            auto_stash_ref,
+                            prompt_user=prompt_for_restore,
+                            input_fn=gw_input_fn,
+                        )
+
+        if safe_rebase_fork and auto_stash_ref is not None:
+            _restore_stashed_changes(
+                git_cmd,
+                PROJECT_ROOT,
+                auto_stash_ref,
+                prompt_user=prompt_for_restore,
+                input_fn=gw_input_fn,
+            )
+
         _invalidate_update_cache()
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
@@ -3815,8 +4003,8 @@ def cmd_update(args):
         if removed:
             print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        # Legacy fork handling for plain `update`; `update-safe` already did its own git sync.
+        if is_fork and branch == "main" and not safe_rebase_fork:
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
         
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
@@ -3979,7 +4167,7 @@ def cmd_update(args):
         
         print()
         print("✓ Update complete!")
-        
+
         # Write exit code *before* the gateway restart attempt.
         # When running as ``hermes update --gateway`` (spawned by the gateway's
         # /update command), this process lives inside the gateway's systemd
@@ -3999,7 +4187,7 @@ def cmd_update(args):
                 _exit_code_path.write_text("0")
             except OSError:
                 pass
-        
+
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
         # running gateway needs restarting to pick up the new code.
@@ -4014,8 +4202,6 @@ def cmd_update(args):
             restarted_services = []
             killed_pids = set()
 
-            # --- Systemd services (Linux) ---
-            # Discover all hermes-gateway* units (default + profiles)
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
@@ -4032,11 +4218,10 @@ def cmd_update(args):
                             parts = line.split()
                             if not parts:
                                 continue
-                            unit = parts[0]  # e.g. hermes-gateway.service or hermes-gateway-coder.service
+                            unit = parts[0]
                             if not unit.endswith(".service"):
                                 continue
                             svc_name = unit.removesuffix(".service")
-                            # Check if active
                             check = subprocess.run(
                                 scope_cmd + ["is-active", svc_name],
                                 capture_output=True, text=True, timeout=5,
@@ -4053,7 +4238,6 @@ def cmd_update(args):
                     except (FileNotFoundError, subprocess.TimeoutExpired):
                         pass
 
-            # --- Launchd services (macOS) ---
             if is_macos():
                 try:
                     from hermes_cli.gateway import launchd_restart, get_launchd_label, get_launchd_plist_path
@@ -4073,10 +4257,6 @@ def cmd_update(args):
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 
-            # --- Manual (non-service) gateways ---
-            # Kill any remaining gateway processes not managed by a service.
-            # Exclude PIDs that belong to just-restarted services so we don't
-            # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
             manual_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
             for pid in manual_pids:
@@ -4093,21 +4273,16 @@ def cmd_update(args):
                 if killed_pids:
                     print(f"  → Stopped {len(killed_pids)} manual gateway process(es)")
                     print("    Restart manually: hermes gateway run")
-                    # Also restart for each profile if needed
                     if len(killed_pids) > 1:
                         print("    (or: hermes -p <profile> gateway run  for each profile)")
 
-            if not restarted_services and not killed_pids:
-                # No gateways were running — nothing to do
-                pass
-
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
-        
+
         print()
         print("Tip: You can now select a provider and model:")
         print("  hermes model              # Select provider and model")
-        
+
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
             print(f"⚠ Git update failed: {e}")
@@ -4117,6 +4292,16 @@ def cmd_update(args):
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+
+
+def cmd_update(args):
+    """Update Hermes Agent to the latest version."""
+    _run_update_flow(args, safe_rebase_fork=False)
+
+
+def cmd_update_safe(args):
+    """Update Hermes Agent with fork-aware upstream rebase logic."""
+    _run_update_flow(args, safe_rebase_fork=True)
 
 
 def _coalesce_session_name_args(argv: list) -> list:
@@ -5818,6 +6003,17 @@ Examples:
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)"
     )
     update_parser.set_defaults(func=cmd_update)
+
+    update_safe_parser = subparsers.add_parser(
+        "update-safe",
+        help="Update Hermes Agent with fork-aware rebase logic",
+        description="Rebase your fork's main branch onto upstream/main, push it back to origin, then refresh dependencies"
+    )
+    update_safe_parser.add_argument(
+        "--gateway", action="store_true", default=False,
+        help="Gateway mode: use file-based IPC for prompts instead of stdin"
+    )
+    update_safe_parser.set_defaults(func=cmd_update_safe)
     
     # =========================================================================
     # uninstall command
