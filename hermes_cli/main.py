@@ -4516,7 +4516,7 @@ def _update_via_zip(args):
     print("✓ Update complete!")
 
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[dict[str, str]]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -4527,10 +4527,6 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     if not status.stdout.strip():
         return None
 
-    # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
-    # git stash will fail with "needs merge / could not write index".  Clear the
-    # conflict state with `git reset` so the stash can proceed.  Working-tree
-    # changes are preserved; only the index conflict markers are dropped.
     unmerged = subprocess.run(
         git_cmd + ["ls-files", "--unmerged"],
         cwd=cwd,
@@ -4559,7 +4555,8 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         text=True,
         check=True,
     ).stdout.strip()
-    return stash_ref
+    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref) or ""
+    return {"ref": stash_ref, "selector": stash_selector, "name": stash_name}
 
 
 def _resolve_stash_selector(
@@ -4594,12 +4591,26 @@ def _print_stash_cleanup_guidance(
         )
 
 
+def _drop_stash_entry(git_cmd: list[str], cwd: Path, stash_ref: str, stash_selector: Optional[str] = None) -> bool:
+    selector = stash_selector or _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if selector is None:
+        return False
+    drop = subprocess.run(
+        git_cmd + ["stash", "drop", selector],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return drop.returncode == 0
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    stash_selector: Optional[str] = None,
 ) -> bool:
     if prompt_user:
         print()
@@ -4668,18 +4679,14 @@ def _restore_stashed_changes(
         # skill sync, and gateway restart.
         return False
 
-    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
-        print(
-            "⚠ Local changes were restored, but Hermes couldn't find the stash entry to drop."
-        )
-        print(
-            "  The stash was left in place. You can remove it manually after checking the result."
-        )
+    effective_selector = stash_selector or _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if effective_selector is None:
+        print("⚠ Local changes were restored, but Hermes couldn't find the stash entry to drop.")
+        print("  The stash was left in place. You can remove it manually after checking the result.")
         _print_stash_cleanup_guidance(stash_ref)
     else:
         drop = subprocess.run(
-            git_cmd + ["stash", "drop", stash_selector],
+            git_cmd + ["stash", "drop", effective_selector],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -4692,15 +4699,35 @@ def _restore_stashed_changes(
                 print(drop.stdout.strip())
             if drop.stderr.strip():
                 print(drop.stderr.strip())
-            print(
-                "  The stash was left in place. You can remove it manually after checking the result."
-            )
-            _print_stash_cleanup_guidance(stash_ref, stash_selector)
+            print("  The stash was left in place. You can remove it manually after checking the result.")
+            _print_stash_cleanup_guidance(stash_ref, effective_selector)
 
     print("⚠ Local changes were restored on top of the updated codebase.")
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
     return True
 
+
+
+def _cleanup_update_autostash_if_redundant(
+    git_cmd: list[str], cwd: Path, stash_ref: str, stash_selector: Optional[str] = None
+) -> bool:
+    """Drop a leftover update autostash when the working tree is already clean.
+
+    This handles the annoying case where update restored cleanly, but a later
+    dependency step changed and then normalized generated files such as lockfiles,
+    leaving the stash entry behind even though there is nothing meaningful to keep.
+    """
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if status.stdout.strip():
+        return False
+
+    return _drop_stash_entry(git_cmd, cwd, stash_ref, stash_selector)
 
 # =========================================================================
 # Fork detection and upstream management for `hermes update`
@@ -5391,112 +5418,136 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Always update against main
         branch = "main"
 
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
-            label = (
-                "detached HEAD"
-                if current_branch == "HEAD"
-                else f"branch '{current_branch}'"
+        auto_stash = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+
+        try:
+            if safe_rebase_fork and is_fork:
+                print("→ Preparing fork-aware sync on main...")
+                _ensure_local_branch_tracks_remote(
+                    git_cmd, PROJECT_ROOT, branch, f"origin/{branch}"
+                )
+            elif current_branch != "main":
+                label = (
+                    "detached HEAD"
+                    if current_branch == "HEAD"
+                    else f"branch '{current_branch}'"
+                )
+                print(f"  ⚠ Currently on {label} — switching to main for update...")
+                subprocess.run(
+                    git_cmd + ["checkout", "main"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            print(f"✗ Failed to prepare branch for update: {exc}")
+            if auto_stash is not None:
+                print(f"  Local changes are preserved in stash: {auto_stash['ref']}")
+            sys.exit(1)
+
+        prompt_for_restore = auto_stash is not None and (
+            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
+        )
+
+        if safe_rebase_fork and is_fork:
+            update_succeeded = _sync_fork_with_rebase(
+                git_cmd, PROJECT_ROOT, branch=branch
             )
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", "main"],
+            if not update_succeeded:
+                print("  Update stopped before dependency refresh.")
+                if auto_stash is not None:
+                    print(f"  Local changes are preserved in stash: {auto_stash['ref']}")
+                sys.exit(1)
+        else:
+            # Check if there are updates
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
                 check=True,
             )
-        else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            commit_count = int(result.stdout.strip())
 
-        prompt_for_restore = auto_stash_ref is not None and (
-            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
-        )
-
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
-
-        if commit_count == 0:
-            _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            print("✓ Already up to date!")
-            return
-
-        print(f"→ Found {commit_count} new commit(s)")
-
-        print("→ Pulling updates...")
-        update_succeeded = False
-        try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        "  Try manually: git fetch origin && git reset --hard origin/main"
-                    )
-                    sys.exit(1)
-            update_succeeded = True
-        finally:
-            if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(
-                        f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
-                    )
-                    print(f"  Restore manually with: git stash apply")
-                else:
+            if commit_count == 0:
+                _invalidate_update_cache()
+                if auto_stash is not None:
                     _restore_stashed_changes(
                         git_cmd,
                         PROJECT_ROOT,
-                        auto_stash_ref,
+                        auto_stash["ref"],
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
+                        stash_selector=auto_stash.get("selector") or None,
                     )
+                if current_branch not in ("main", "HEAD"):
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                print("✓ Already up to date!")
+                return
+
+            print(f"→ Found {commit_count} new commit(s)")
+
+            print("→ Pulling updates...")
+            update_succeeded = False
+            try:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if pull_result.returncode != 0:
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            "  Try manually: git fetch origin && git reset --hard origin/main"
+                        )
+                        sys.exit(1)
+                update_succeeded = True
+            finally:
+                if auto_stash is not None:
+                    if not update_succeeded:
+                        print(
+                            f"  ℹ️  Local changes preserved in stash (ref: {auto_stash['ref']})"
+                        )
+                        print("  Restore manually with: git stash apply")
+                    else:
+                        _restore_stashed_changes(
+                            git_cmd,
+                            PROJECT_ROOT,
+                            auto_stash["ref"],
+                            prompt_user=prompt_for_restore,
+                            input_fn=gw_input_fn,
+                            stash_selector=auto_stash.get("selector") or None,
+                        )
+
+        if safe_rebase_fork and auto_stash is not None:
+            _restore_stashed_changes(
+                git_cmd,
+                PROJECT_ROOT,
+                auto_stash["ref"],
+                prompt_user=prompt_for_restore,
+                input_fn=gw_input_fn,
+                stash_selector=auto_stash.get("selector") or None,
+            )
 
         _invalidate_update_cache()
 
@@ -5509,8 +5560,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        # Legacy fork handling for plain `update`; `update-safe` already did its own git sync.
+        if is_fork and branch == "main" and not safe_rebase_fork:
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
@@ -5546,6 +5597,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
+
+        if auto_stash is not None:
+            _cleanup_update_autostash_if_redundant(
+                git_cmd,
+                PROJECT_ROOT,
+                auto_stash['ref'],
+                stash_selector=auto_stash.get('selector') or None,
+            )
 
         print()
         print("✓ Code updated!")
