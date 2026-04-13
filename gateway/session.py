@@ -373,6 +373,13 @@ class SessionEntry:
     # this session (create a new session_id) so the user starts fresh.
     # Set by /stop to break stuck-resume loops (#7536).
     suspended: bool = False
+
+    # Proactive no-response follow-up state.
+    followup_pending: bool = False
+    followup_reason: Optional[str] = None
+    followup_due_at: Optional[datetime] = None
+    followup_sent_at: Optional[datetime] = None
+    followup_context: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -393,6 +400,11 @@ class SessionEntry:
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
             "suspended": self.suspended,
+            "followup_pending": self.followup_pending,
+            "followup_reason": self.followup_reason,
+            "followup_due_at": self.followup_due_at.isoformat() if self.followup_due_at else None,
+            "followup_sent_at": self.followup_sent_at.isoformat() if self.followup_sent_at else None,
+            "followup_context": self.followup_context,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -430,6 +442,11 @@ class SessionEntry:
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
             suspended=data.get("suspended", False),
+            followup_pending=data.get("followup_pending", False),
+            followup_reason=data.get("followup_reason"),
+            followup_due_at=datetime.fromisoformat(data["followup_due_at"]) if data.get("followup_due_at") else None,
+            followup_sent_at=datetime.fromisoformat(data["followup_sent_at"]) if data.get("followup_sent_at") else None,
+            followup_context=data.get("followup_context"),
         )
 
 
@@ -713,6 +730,10 @@ class SessionStore:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
                     entry.updated_at = now
+                    entry.followup_pending = False
+                    entry.followup_reason = None
+                    entry.followup_due_at = None
+                    entry.followup_context = None
                     self._save()
                     return entry
                 else:
@@ -782,6 +803,67 @@ class SessionStore:
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
                 self._save()
+
+    def schedule_followup(
+        self,
+        session_key: str,
+        *,
+        due_at: datetime,
+        reason: str,
+        context: Optional[str] = None,
+    ) -> bool:
+        """Schedule a proactive follow-up for a session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            entry.followup_pending = True
+            entry.followup_reason = reason
+            entry.followup_due_at = due_at
+            entry.followup_sent_at = None
+            entry.followup_context = context
+            self._save()
+            return True
+
+    def clear_followup(self, session_key: str) -> bool:
+        """Clear any pending proactive follow-up for a session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            entry.followup_pending = False
+            entry.followup_reason = None
+            entry.followup_due_at = None
+            entry.followup_context = None
+            self._save()
+            return True
+
+    def mark_followup_sent(self, session_key: str, sent_at: Optional[datetime] = None) -> bool:
+        """Mark a pending follow-up as delivered."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            entry.followup_pending = False
+            entry.followup_sent_at = sent_at or _now()
+            entry.followup_due_at = None
+            self._save()
+            return True
+
+    def get_due_followups(self, now: Optional[datetime] = None) -> List[SessionEntry]:
+        """Return sessions whose proactive follow-up is due."""
+        now = now or _now()
+        with self._lock:
+            self._ensure_loaded_locked()
+            due = [
+                entry for entry in self._entries.values()
+                if entry.followup_pending and entry.followup_due_at and entry.followup_due_at <= now
+            ]
+        due.sort(key=lambda e: e.followup_due_at or now)
+        return due
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.

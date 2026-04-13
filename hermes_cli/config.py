@@ -55,7 +55,7 @@ _EXTRA_ENV_KEYS = frozenset({
 import yaml
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.default_soul import DEFAULT_SOUL_MD
+from hermes_cli.default_soul import DEFAULT_SOUL_MD, DEFAULT_RELATIONSHIP_MD
 
 
 # =============================================================================
@@ -262,6 +262,15 @@ def _ensure_default_soul_md(home: Path) -> None:
     _secure_file(soul_path)
 
 
+def _ensure_default_relationship_md(home: Path) -> None:
+    """Seed a default RELATIONSHIP.md into HERMES_HOME if missing."""
+    relationship_path = home / "RELATIONSHIP.md"
+    if relationship_path.exists():
+        return
+    relationship_path.write_text(DEFAULT_RELATIONSHIP_MD, encoding="utf-8")
+    _secure_file(relationship_path)
+
+
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists with secure permissions.
 
@@ -284,6 +293,7 @@ def ensure_hermes_home():
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
         _ensure_default_soul_md(home)
+        _ensure_default_relationship_md(home)
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -300,8 +310,9 @@ def _ensure_hermes_home_managed(home: Path):
                 f"{d} does not exist. "
                 "Run 'sudo nixos-rebuild switch' first."
             )
-    # Inside umask(0o007) scope — SOUL.md will be created as 0660
+    # Inside umask(0o007) scope — identity files will be created as 0660
     _ensure_default_soul_md(home)
+    _ensure_default_relationship_md(home)
 
 
 # =============================================================================

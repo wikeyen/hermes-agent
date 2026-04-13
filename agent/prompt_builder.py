@@ -132,8 +132,8 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # =========================================================================
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
+    "You are Hermes Agent, an intelligent AI presence created by Nous Research. "
+    "You are helpful, knowledgeable, and direct. You help users with a wide "
     "range of tasks including answering questions, writing and editing code, "
     "analyzing information, creative work, and executing actions via your tools. "
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
@@ -855,7 +855,7 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
 
 # =========================================================================
-# Context files (SOUL.md, AGENTS.md, .cursorrules)
+# Context files (SOUL.md, RELATIONSHIP.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
 def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE_MAX_CHARS) -> str:
@@ -895,6 +895,23 @@ def load_soul_md() -> Optional[str]:
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        return None
+
+
+def load_relationship_md() -> Optional[str]:
+    """Load RELATIONSHIP.md from HERMES_HOME and return wrapped content, or None."""
+    relationship_path = get_hermes_home() / "RELATIONSHIP.md"
+    if not relationship_path.exists():
+        return None
+    try:
+        content = relationship_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "RELATIONSHIP.md")
+        result = f"## RELATIONSHIP.md\n\n{content}"
+        return _truncate_content(result, "RELATIONSHIP.md")
+    except Exception as e:
+        logger.debug("Could not read RELATIONSHIP.md from %s: %s", relationship_path, e)
         return None
 
 
@@ -993,6 +1010,7 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
+    RELATIONSHIP.md from HERMES_HOME is also included when present.
     Each context source is capped at 20,000 chars.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
@@ -1019,6 +1037,10 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
         soul_content = load_soul_md()
         if soul_content:
             sections.append(soul_content)
+
+    relationship_content = load_relationship_md()
+    if relationship_content:
+        sections.append(relationship_content)
 
     if not sections:
         return ""

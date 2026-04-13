@@ -11,7 +11,7 @@ zero migration needed.
 Usage::
 
     hermes profile create coder          # fresh profile + bundled skills
-    hermes profile create coder --clone  # also copy config, .env, SOUL.md
+    hermes profile create coder --clone  # also copy config, .env, SOUL.md, RELATIONSHIP.md
     hermes profile create coder --clone-all  # full copy of source profile
     coder chat                           # use via wrapper alias
     hermes -p coder chat                 # or via flag
@@ -54,6 +54,7 @@ _CLONE_CONFIG_FILES = [
     "config.yaml",
     ".env",
     "SOUL.md",
+    "RELATIONSHIP.md",
 ]
 
 # Subdirectory files copied during --clone (path relative to profile root).
@@ -459,15 +460,20 @@ def create_profile(
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
 
-    # Seed a default SOUL.md so the user has a file to customize immediately.
-    # Skipped when the profile already has one (from --clone / --clone-all).
-    soul_path = profile_dir / "SOUL.md"
-    if not soul_path.exists():
-        try:
-            from hermes_cli.default_soul import DEFAULT_SOUL_MD
+    # Seed default identity files so the user has files to customize immediately.
+    # Skipped when the profile already has them (from --clone / --clone-all).
+    try:
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD, DEFAULT_RELATIONSHIP_MD
+
+        soul_path = profile_dir / "SOUL.md"
+        if not soul_path.exists():
             soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
-        except Exception:
-            pass  # best-effort — don't fail profile creation over this
+
+        relationship_path = profile_dir / "RELATIONSHIP.md"
+        if not relationship_path.exists():
+            relationship_path.write_text(DEFAULT_RELATIONSHIP_MD, encoding="utf-8")
+    except Exception:
+        pass  # best-effort — don't fail profile creation over this
 
     return profile_dir
 

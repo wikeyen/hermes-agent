@@ -273,7 +273,7 @@ class _CodexCompletionsAdapter:
         # Separate system/instructions from conversation messages.
         # Convert chat.completions multimodal content blocks to Responses
         # API format (input_text / input_image instead of text / image_url).
-        instructions = "You are a helpful assistant."
+        instructions = "You are a helpful presence."
         input_msgs: List[Dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role", "user")

@@ -51,6 +51,13 @@ class TestEnsureHermesHome:
             assert soul_path.exists()
             assert soul_path.read_text(encoding="utf-8").strip() != ""
 
+    def test_creates_default_relationship_md_if_missing(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            ensure_hermes_home()
+            relationship_path = tmp_path / "RELATIONSHIP.md"
+            assert relationship_path.exists()
+            assert relationship_path.read_text(encoding="utf-8").strip() != ""
+
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"

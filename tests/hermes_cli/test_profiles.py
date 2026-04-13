@@ -142,12 +142,14 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        (default_home / "RELATIONSHIP.md").write_text("Be close and honest.")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
         assert (profile_dir / "config.yaml").read_text() == "model: test"
         assert (profile_dir / ".env").read_text() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / "RELATIONSHIP.md").read_text() == "Be close and honest."
 
     def test_clone_all_copies_entire_tree(self, profile_env):
         tmp_path = profile_env
@@ -179,6 +181,7 @@ class TestCreateProfile:
         assert not (profile_dir / ".env").exists()
         # SOUL.md is always seeded with the default even when clone source lacks it
         assert (profile_dir / "SOUL.md").exists()
+        assert (profile_dir / "RELATIONSHIP.md").exists()
 
 
 # ===================================================================

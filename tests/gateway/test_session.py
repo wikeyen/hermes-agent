@@ -1010,3 +1010,92 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning") == "I need to think step by step."
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+
+
+class TestConversationFollowupState:
+    def test_session_entry_roundtrip_preserves_followup_fields(self):
+        from datetime import datetime, timedelta
+        from gateway.session import SessionEntry
+
+        now = datetime.now()
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=now,
+            updated_at=now,
+            followup_pending=True,
+            followup_reason="question",
+            followup_due_at=now + timedelta(minutes=30),
+            followup_sent_at=now,
+            followup_context="Want to keep going?",
+        )
+        restored = SessionEntry.from_dict(entry.to_dict())
+        assert restored.followup_pending is True
+        assert restored.followup_reason == "question"
+        assert restored.followup_due_at == entry.followup_due_at
+        assert restored.followup_sent_at == entry.followup_sent_at
+        assert restored.followup_context == "Want to keep going?"
+
+    def test_schedule_and_clear_followup(self, tmp_path):
+        from datetime import datetime, timedelta
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        store._entries = {"k1": entry}
+
+        due_at = datetime.now() + timedelta(minutes=10)
+        assert store.schedule_followup("k1", due_at=due_at, reason="task", context="ship the thing") is True
+        assert entry.followup_pending is True
+        assert entry.followup_reason == "task"
+        assert entry.followup_due_at == due_at
+        assert entry.followup_context == "ship the thing"
+
+        assert store.clear_followup("k1") is True
+        assert entry.followup_pending is False
+        assert entry.followup_reason is None
+        assert entry.followup_due_at is None
+        assert entry.followup_context is None
+
+    def test_get_due_followups_returns_only_due_entries(self, tmp_path):
+        from datetime import datetime, timedelta
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+
+        now = datetime.now()
+        due = SessionEntry(
+            session_key="due",
+            session_id="s1",
+            created_at=now,
+            updated_at=now,
+            followup_pending=True,
+            followup_due_at=now - timedelta(minutes=1),
+        )
+        later = SessionEntry(
+            session_key="later",
+            session_id="s2",
+            created_at=now,
+            updated_at=now,
+            followup_pending=True,
+            followup_due_at=now + timedelta(minutes=10),
+        )
+        store._entries = {"due": due, "later": later}
+
+        due_entries = store.get_due_followups(now)
+        assert [entry.session_key for entry in due_entries] == ["due"]

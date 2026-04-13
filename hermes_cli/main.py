@@ -4406,7 +4406,7 @@ def main():
     """Main entry point for hermes CLI."""
     parser = argparse.ArgumentParser(
         prog="hermes",
-        description="Hermes Agent - AI assistant with tool-calling capabilities",
+        description="Hermes Agent - AI agent with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

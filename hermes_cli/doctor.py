@@ -442,10 +442,31 @@ def run_doctor(args):
             soul_path.write_text(
                 "# Hermes Agent Persona\n\n"
                 "<!-- Edit this file to customize how Hermes communicates. -->\n\n"
-                "You are Hermes, a helpful AI assistant.\n",
+                "You are Hermes, a helpful presence.\n",
                 encoding="utf-8",
             )
             check_ok(f"Created {_DHH}/SOUL.md with basic template")
+            fixed_count += 1
+
+    relationship_path = hermes_home / "RELATIONSHIP.md"
+    if relationship_path.exists():
+        content = relationship_path.read_text(encoding="utf-8").strip()
+        lines = [l for l in content.splitlines() if l.strip() and not l.strip().startswith(("<!--", "-->", "#"))]
+        if lines:
+            check_ok(f"{_DHH}/RELATIONSHIP.md exists (relationship configured)")
+        else:
+            check_info(f"{_DHH}/RELATIONSHIP.md exists but is empty — edit it to define user-specific bond")
+    else:
+        check_warn(f"{_DHH}/RELATIONSHIP.md not found", "(create it to define how Hermes relates to the user)")
+        if should_fix:
+            relationship_path.parent.mkdir(parents=True, exist_ok=True)
+            relationship_path.write_text(
+                "# Relationship with the User\n\n"
+                "<!-- Edit this file to define how Hermes should relate to the user. -->\n\n"
+                "Be warm, respectful, perceptive, and honest.\n",
+                encoding="utf-8",
+            )
+            check_ok(f"Created {_DHH}/RELATIONSHIP.md with basic template")
             fixed_count += 1
     
     # Check memory directory

@@ -218,6 +218,44 @@ class StreamingConfig:
 
 
 @dataclass
+class ConversationFollowupConfig:
+    """Configuration for proactive no-response follow-ups in DMs."""
+
+    enabled: bool = False
+    check_interval_seconds: int = 300
+    default_delay_minutes: int = 90
+    question_delay_minutes: int = 45
+    emotional_delay_minutes: int = 30
+    task_delay_minutes: int = 120
+    only_dms: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "check_interval_seconds": self.check_interval_seconds,
+            "default_delay_minutes": self.default_delay_minutes,
+            "question_delay_minutes": self.question_delay_minutes,
+            "emotional_delay_minutes": self.emotional_delay_minutes,
+            "task_delay_minutes": self.task_delay_minutes,
+            "only_dms": self.only_dms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConversationFollowupConfig":
+        if not data:
+            return cls()
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            check_interval_seconds=int(data.get("check_interval_seconds", 300)),
+            default_delay_minutes=int(data.get("default_delay_minutes", 90)),
+            question_delay_minutes=int(data.get("question_delay_minutes", 45)),
+            emotional_delay_minutes=int(data.get("emotional_delay_minutes", 30)),
+            task_delay_minutes=int(data.get("task_delay_minutes", 120)),
+            only_dms=_coerce_bool(data.get("only_dms"), True),
+        )
+
+
+@dataclass
 class GatewayConfig:
     """
     Main gateway configuration.
@@ -256,6 +294,9 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Proactive DM follow-ups after meaningful silence
+    conversation_followups: ConversationFollowupConfig = field(default_factory=ConversationFollowupConfig)
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -353,6 +394,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "conversation_followups": self.conversation_followups.to_dict(),
         }
     
     @classmethod
@@ -414,6 +456,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            conversation_followups=ConversationFollowupConfig.from_dict(data.get("conversation_followups", {})),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -493,6 +536,10 @@ def load_gateway_config() -> GatewayConfig:
             streaming_cfg = yaml_cfg.get("streaming")
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            followup_cfg = yaml_cfg.get("conversation_followups")
+            if isinstance(followup_cfg, dict):
+                gw_data["conversation_followups"] = followup_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
@@ -1086,5 +1133,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if reset_hour:
         try:
             config.default_reset_policy.at_hour = int(reset_hour)
+        except ValueError:
+            pass
+
+    followups_enabled = os.getenv("CONVERSATION_FOLLOWUPS_ENABLED")
+    if followups_enabled is not None and followups_enabled != "":
+        config.conversation_followups.enabled = _coerce_bool(followups_enabled, False)
+
+    followup_delay = os.getenv("CONVERSATION_FOLLOWUPS_DELAY_MINUTES")
+    if followup_delay:
+        try:
+            config.conversation_followups.default_delay_minutes = int(followup_delay)
         except ValueError:
             pass
