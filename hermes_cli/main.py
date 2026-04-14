@@ -3388,10 +3388,21 @@ def _ensure_local_branch_tracks_remote(git_cmd: list[str], cwd: Path, branch: st
         )
 
 
-def _try_push_branch(git_cmd: list[str], cwd: Path, remote: str, branch: str) -> tuple[bool, str]:
+def _try_push_branch(
+    git_cmd: list[str],
+    cwd: Path,
+    remote: str,
+    branch: str,
+    *,
+    force_with_lease: bool = False,
+) -> tuple[bool, str]:
     try:
+        push_cmd = git_cmd + ["push"]
+        if force_with_lease:
+            push_cmd.append("--force-with-lease")
+        push_cmd += [remote, branch]
         result = subprocess.run(
-            git_cmd + ["push", remote, branch],
+            push_cmd,
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -3720,7 +3731,13 @@ def _sync_fork_with_rebase(git_cmd: list[str], cwd: Path, branch: str = "main") 
         return False
 
     print("→ Pushing rebased branch to origin...")
-    pushed, push_output = _try_push_branch(git_cmd, cwd, "origin", branch)
+    pushed, push_output = _try_push_branch(
+        git_cmd,
+        cwd,
+        "origin",
+        branch,
+        force_with_lease=True,
+    )
     if not pushed:
         print("✗ Rebase succeeded locally, but push to origin failed.")
         if push_output:
