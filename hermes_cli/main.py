@@ -4743,6 +4743,120 @@ OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 
+def _fetch_remote(git_cmd: list[str], cwd: Path, remote: str, quiet: bool = False) -> bool:
+    """Fetch a git remote, returning True on success."""
+    cmd = git_cmd + ["fetch", remote]
+    if quiet:
+        cmd.append("--quiet")
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _branch_exists(ref: str, git_cmd: list[str], cwd: Path) -> bool:
+    try:
+        result = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", f"refs/remotes/{ref}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_local_branch_tracks_remote(git_cmd: list[str], cwd: Path, branch: str, remote_ref: str) -> None:
+    local_exists = subprocess.run(
+        git_cmd + ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+    if local_exists:
+        subprocess.run(
+            git_cmd + ["checkout", branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    else:
+        subprocess.run(
+            git_cmd + ["checkout", "-b", branch, remote_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+
+def _try_push_branch(
+    git_cmd: list[str],
+    cwd: Path,
+    remote: str,
+    branch: str,
+    *,
+    force_with_lease: bool = False,
+) -> tuple[bool, str]:
+    try:
+        push_cmd = git_cmd + ["push"]
+        if force_with_lease:
+            push_cmd.append("--force-with-lease")
+        push_cmd += [remote, branch]
+        result = subprocess.run(
+            push_cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        output = "\n".join(
+            part for part in [result.stdout.strip(), result.stderr.strip()] if part
+        ).strip()
+        return result.returncode == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _git_rebase(git_cmd: list[str], cwd: Path, onto_ref: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            git_cmd + ["rebase", onto_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        output = "\n".join(
+            part for part in [result.stdout.strip(), result.stderr.strip()] if part
+        ).strip()
+        return result.returncode == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _abort_rebase_if_active(git_cmd: list[str], cwd: Path) -> None:
+    try:
+        git_dir = subprocess.run(
+            git_cmd + ["rev-parse", "--git-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        rebase_merge = cwd / git_dir / "rebase-merge"
+        rebase_apply = cwd / git_dir / "rebase-apply"
+        if rebase_merge.exists() or rebase_apply.exists():
+            subprocess.run(
+                git_cmd + ["rebase", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+    except Exception:
+        pass
+
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     """Get the URL of the origin remote, or None if not set."""
     try:
@@ -4966,6 +5080,126 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
         )
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
+
+
+def _sync_fork_with_rebase(git_cmd: list[str], cwd: Path, branch: str = "main") -> bool:
+    """Sync a forked repo by rebasing fork main onto upstream main.
+
+    This is the safer path for customized forks:
+    - fetch origin + upstream
+    - ensure local branch exists and tracks origin/main
+    - fast-reset local branch to origin/main
+    - if upstream is ahead, rebase local branch onto upstream/main
+    - push rebased branch back to origin
+
+    Returns True when git sync completed cleanly, False when update should stop.
+    """
+    has_upstream = _has_upstream_remote(git_cmd, cwd)
+    if not has_upstream:
+        if _should_skip_upstream_prompt():
+            print("✗ Cannot run update-safe on a fork without an upstream remote.")
+            print(
+                "  Add upstream manually: git remote add upstream https://github.com/NousResearch/hermes-agent.git"
+            )
+            return False
+        print()
+        print("ℹ Your fork is not tracking the official Hermes repository.")
+        print("  update-safe needs an 'upstream' remote so it can rebase your fork cleanly.")
+        print()
+        try:
+            response = input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            response = "n"
+        if response in ("", "y", "yes"):
+            print("→ Adding upstream remote...")
+            if not _add_upstream_remote(git_cmd, cwd):
+                print("  ✗ Failed to add upstream remote.")
+                return False
+            print("  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git")
+        else:
+            print("  Skipped. update-safe cannot continue without upstream.")
+            _mark_skip_upstream_prompt()
+            return False
+
+    print("→ Fetching origin...")
+    if not _fetch_remote(git_cmd, cwd, "origin"):
+        print("✗ Failed to fetch origin.")
+        return False
+
+    print("→ Fetching upstream...")
+    if not _fetch_remote(git_cmd, cwd, "upstream"):
+        print("✗ Failed to fetch upstream.")
+        return False
+
+    if not _branch_exists(f"origin/{branch}", git_cmd, cwd):
+        print(f"✗ origin/{branch} does not exist.")
+        return False
+    if not _branch_exists(f"upstream/{branch}", git_cmd, cwd):
+        print(f"✗ upstream/{branch} does not exist.")
+        return False
+
+    try:
+        _ensure_local_branch_tracks_remote(git_cmd, cwd, branch, f"origin/{branch}")
+    except subprocess.CalledProcessError as exc:
+        print(f"✗ Failed to check out local {branch}: {exc}")
+        return False
+
+    print(f"→ Aligning local {branch} with origin/{branch}...")
+    try:
+        subprocess.run(
+            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"✗ Failed to reset local {branch} to origin/{branch}: {exc}")
+        return False
+
+    fork_ahead = _count_commits_between(
+        git_cmd, cwd, f"upstream/{branch}", f"origin/{branch}"
+    )
+    upstream_ahead = _count_commits_between(
+        git_cmd, cwd, f"origin/{branch}", f"upstream/{branch}"
+    )
+    if fork_ahead < 0 or upstream_ahead < 0:
+        print("✗ Could not compare origin and upstream history.")
+        return False
+
+    if upstream_ahead == 0:
+        print("✓ Fork already includes upstream changes.")
+        return True
+
+    print(f"→ Rebasing fork {branch} onto upstream/{branch}...")
+    ok, output = _git_rebase(git_cmd, cwd, f"upstream/{branch}")
+    if not ok:
+        print(
+            "✗ Rebase hit conflicts. Resolve them, then run `git rebase --continue` or `git rebase --abort`."
+        )
+        if output:
+            print(output)
+        return False
+
+    print("→ Pushing rebased branch to origin...")
+    pushed, push_output = _try_push_branch(
+        git_cmd,
+        cwd,
+        "origin",
+        branch,
+        force_with_lease=True,
+    )
+    if not pushed:
+        print("✗ Rebase succeeded locally, but push to origin failed.")
+        if push_output:
+            print(push_output)
+        return False
+
+    total = fork_ahead + upstream_ahead
+    print(f"✓ Fork main updated and pushed ({total} combined commit(s) considered).")
+    return True
 
 
 def _invalidate_update_cache():
