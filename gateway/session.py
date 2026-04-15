@@ -379,16 +379,23 @@ class SessionEntry:
     suspended: bool = False
 
     # When True the session was interrupted by a gateway restart/shutdown
-    # drain timeout, but recovery is still expected.  Unlike ``suspended``,
+    # drain timeout, but recovery is still expected. Unlike ``suspended``,
     # ``resume_pending`` preserves the existing session_id on next access —
     # the user stays on the same transcript and the agent auto-continues
-    # from where it left off.  Cleared after the next successful turn.
+    # from where it left off. Cleared after the next successful turn.
     # Escalation to ``suspended`` is handled by the existing
     # ``.restart_failure_counts`` stuck-loop counter (#7536), not by a
     # parallel counter on this entry.
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+
+    # Proactive conversation follow-up state.
+    followup_pending: bool = False
+    followup_reason: Optional[str] = None
+    followup_due_at: Optional[datetime] = None
+    followup_sent_at: Optional[datetime] = None
+    followup_context: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -416,6 +423,11 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "followup_pending": self.followup_pending,
+            "followup_reason": self.followup_reason,
+            "followup_due_at": self.followup_due_at.isoformat() if self.followup_due_at else None,
+            "followup_sent_at": self.followup_sent_at.isoformat() if self.followup_sent_at else None,
+            "followup_context": self.followup_context,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -464,6 +476,19 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            followup_pending=data.get("followup_pending", False),
+            followup_reason=data.get("followup_reason"),
+            followup_due_at=(
+                datetime.fromisoformat(data["followup_due_at"])
+                if data.get("followup_due_at")
+                else None
+            ),
+            followup_sent_at=(
+                datetime.fromisoformat(data["followup_sent_at"])
+                if data.get("followup_sent_at")
+                else None
+            ),
+            followup_context=data.get("followup_context"),
         )
 
 
@@ -782,6 +807,10 @@ class SessionStore:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
                     entry.updated_at = now
+                    entry.followup_pending = False
+                    entry.followup_reason = None
+                    entry.followup_due_at = None
+                    entry.followup_context = None
                     self._save()
                     return entry
                 else:
@@ -875,7 +904,7 @@ class SessionStore:
         """Mark a session as resumable after a restart interruption.
 
         Unlike ``suspend_session()``, this preserves the existing
-        ``session_id`` and the transcript.  The next call to
+        ``session_id`` and the transcript. The next call to
         ``get_or_create_session()`` for this key returns the same entry
         so the user auto-resumes on the same conversation lane.
 
@@ -885,8 +914,6 @@ class SessionStore:
             self._ensure_loaded_locked()
             if session_key in self._entries:
                 entry = self._entries[session_key]
-                # Never override an explicit ``suspended`` — that is a hard
-                # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
                 entry.resume_pending = True
@@ -897,14 +924,7 @@ class SessionStore:
         return False
 
     def clear_resume_pending(self, session_key: str) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn.
-
-        Called from the gateway after ``run_conversation()`` returns a
-        final response for a session that had ``resume_pending=True``,
-        signalling that recovery succeeded.
-
-        Returns True if a flag was cleared.
-        """
+        """Clear the resume-pending flag after a successful resumed turn."""
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
@@ -917,22 +937,7 @@ class SessionStore:
             return True
 
     def prune_old_entries(self, max_age_days: int) -> int:
-        """Drop SessionEntry records older than max_age_days.
-
-        Pruning is based on ``updated_at`` (last activity), not ``created_at``.
-        A session that's been active within the window is kept regardless of
-        how old it is.  Entries marked ``suspended`` are kept — the user
-        explicitly paused them for later resume.  Entries held by an active
-        process (via has_active_processes_fn) are also kept so long-running
-        background work isn't orphaned.
-
-        Pruning is functionally identical to a natural reset-policy expiry:
-        the transcript in SQLite stays, but the session_key → session_id
-        mapping is dropped and the user starts a fresh session on return.
-
-        ``max_age_days <= 0`` disables pruning; returns 0 immediately.
-        Returns the number of entries removed.
-        """
+        """Drop SessionEntry records older than max_age_days."""
         if max_age_days is None or max_age_days <= 0:
             return 0
         from datetime import timedelta
@@ -945,11 +950,6 @@ class SessionStore:
             for key, entry in list(self._entries.items()):
                 if entry.suspended:
                     continue
-                # Never prune sessions with an active background process
-                # attached — the user may still be waiting on output.
-                # The callback is keyed by session_key (see process_registry.
-                # has_active_for_session); passing session_id here used to
-                # never match, so active sessions got pruned anyway.
                 if self._has_active_processes_fn is not None:
                     try:
                         if self._has_active_processes_fn(entry.session_key):
@@ -957,7 +957,8 @@ class SessionStore:
                     except Exception as exc:
                         logger.debug(
                             "has_active_processes_fn raised during prune for %s: %s",
-                            entry.session_key, exc,
+                            entry.session_key,
+                            exc,
                         )
                 if entry.updated_at < cutoff:
                     removed_keys.append(key)
@@ -969,9 +970,73 @@ class SessionStore:
         if removed_keys:
             logger.info(
                 "SessionStore pruned %d entries older than %d days",
-                len(removed_keys), max_age_days,
+                len(removed_keys),
+                max_age_days,
             )
         return len(removed_keys)
+
+    def schedule_followup(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+        due_at: datetime,
+        context: Optional[str] = None,
+    ) -> bool:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            entry.followup_pending = True
+            entry.followup_reason = reason
+            entry.followup_due_at = due_at
+            entry.followup_context = context
+            self._save()
+            return True
+
+    def clear_followup(self, session_key: str, *, keep_sent_at: bool = True) -> bool:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            entry.followup_pending = False
+            entry.followup_reason = None
+            entry.followup_due_at = None
+            entry.followup_context = None
+            if not keep_sent_at:
+                entry.followup_sent_at = None
+            self._save()
+            return True
+
+    def mark_followup_sent(self, session_key: str, sent_at: Optional[datetime] = None) -> bool:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            when = sent_at or _now()
+            entry.followup_pending = False
+            entry.followup_due_at = None
+            entry.followup_reason = None
+            entry.followup_context = None
+            entry.followup_sent_at = when
+            entry.updated_at = when
+            self._save()
+            return True
+
+    def get_due_followups(self, now: Optional[datetime] = None) -> List[SessionEntry]:
+        check_time = now or _now()
+        with self._lock:
+            self._ensure_loaded_locked()
+            return [
+                entry
+                for entry in self._entries.values()
+                if entry.followup_pending
+                and entry.followup_due_at is not None
+                and entry.followup_due_at <= check_time
+            ]
 
     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
         """Mark recently-active sessions as suspended.
