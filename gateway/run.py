@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import sys
@@ -25,7 +26,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,7 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    SessionEntry,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
@@ -1733,6 +1735,9 @@ class GatewayRunner:
         # Start background session expiry watcher for proactive memory flushing
         asyncio.create_task(self._session_expiry_watcher())
 
+        # Start background conversation follow-up watcher for gentle DM check-ins
+        asyncio.create_task(self._conversation_followup_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -2370,6 +2375,205 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    def _conversation_followup_config(self):
+        return getattr(getattr(self, "config", None), "conversation_followups", None)
+
+    @staticmethod
+    def _trim_followup_context(text: Optional[str], limit: int = 80) -> Optional[str]:
+        if not text:
+            return None
+        cleaned = re.sub(r"\s+", " ", str(text)).strip(" .,!?:;-")
+        if not cleaned:
+            return None
+        return cleaned[: limit - 1].rstrip() + "…" if len(cleaned) > limit else cleaned
+
+    def _conversation_followup_delay_minutes(self, reason: str) -> int:
+        cfg = self._conversation_followup_config()
+        if not cfg:
+            return 0
+        bounds = {
+            "question": (cfg.question_min_delay_minutes, cfg.question_max_delay_minutes),
+            "emotional": (cfg.emotional_min_delay_minutes, cfg.emotional_max_delay_minutes),
+            "task": (cfg.task_min_delay_minutes, cfg.task_max_delay_minutes),
+            "checkout": (cfg.checkout_min_delay_minutes, cfg.checkout_max_delay_minutes),
+        }
+        low, high = bounds.get(reason, bounds["checkout"])
+        low = max(1, int(low))
+        high = max(low, int(high))
+        return random.randint(low, high)
+
+    def _classify_conversation_followup(
+        self,
+        *,
+        source: SessionSource,
+        latest_user_text: str,
+        latest_assistant_text: str,
+        transcript: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        cfg = self._conversation_followup_config()
+        if not cfg or not cfg.enabled:
+            return None
+        if cfg.only_dms and getattr(source, "chat_type", "dm") != "dm":
+            return None
+
+        user_text = (latest_user_text or "").strip()
+        assistant_text = (latest_assistant_text or "").strip()
+        if not user_text or user_text.startswith("/"):
+            return None
+
+        trivial = {"ok", "okay", "kk", "k", "thanks", "thank you", "cool", "nice", "lol", "lmao", "yep", "yeah", "nah"}
+        if user_text.lower() in trivial or len(user_text) < 8:
+            return None
+
+        emotional_markers = (
+            "tired", "exhausted", "overwhelmed", "anxious", "anxiety", "sad", "lonely",
+            "stressed", "stress", "rough", "hard day", "burned out", "burnt out", "scared",
+            "worried", "grief", "grieving", "miss", "heavy", "tense",
+        )
+        task_markers = (
+            "tomorrow", "later", "need to", "have to", "should", "finish", "ship", "send",
+            "review", "remind", "follow up", "follow-up", "check back", "want me to", "should i",
+            "need me to",
+        )
+
+        def _contains_marker(text: str, marker: str) -> bool:
+            if " " in marker or "-" in marker:
+                return marker in text
+            return re.search(rf"\b{re.escape(marker)}\b", text) is not None
+
+        combined_user = user_text.lower()
+        combined_assistant = assistant_text.lower()
+        anchor = self._trim_followup_context(user_text)
+
+        if any(_contains_marker(combined_user, marker) for marker in emotional_markers):
+            return {"reason": "emotional", "context": anchor or self._trim_followup_context(assistant_text)}
+
+        if any(_contains_marker(combined_user, marker) for marker in task_markers) or any(_contains_marker(combined_assistant, marker) for marker in ("want me to", "should i", "need me to")):
+            return {"reason": "task", "context": anchor or self._trim_followup_context(assistant_text)}
+
+        if "?" in assistant_text:
+            return {"reason": "question", "context": self._trim_followup_context(assistant_text)}
+
+        conversational_turns = [
+            msg for msg in transcript
+            if msg.get("role") in {"user", "assistant"} and (msg.get("content") or "").strip()
+        ]
+        if len(conversational_turns) >= max(2, int(cfg.min_turns_for_checkout)):
+            total_chars = sum(len((msg.get("content") or "").strip()) for msg in conversational_turns)
+            if total_chars >= 120:
+                return {"reason": "checkout", "context": anchor or self._trim_followup_context(assistant_text)}
+
+        return None
+
+    def _build_conversation_followup_message(
+        self,
+        entry: SessionEntry,
+        transcript: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        reason = (entry.followup_reason or "").strip().lower()
+        context = self._trim_followup_context(entry.followup_context)
+        if reason == "emotional":
+            return f"Just checking in on {context}. You good?" if context else "Just checking in. You good?"
+        if reason == "task":
+            return f"Quick check-in on {context}. Need a hand?" if context else "Quick check-in. Need a hand?"
+        if reason == "question":
+            return f"Circling back on {context}. No rush — what are you thinking?" if context else "Circling back. No rush — what are you thinking?"
+        if reason == "checkout":
+            return f"Just checking in on {context}. How are you holding up?" if context else "Just checking in. How are you holding up?"
+        return None
+
+    def _maybe_schedule_conversation_followup(
+        self,
+        *,
+        source: SessionSource,
+        session_entry: SessionEntry,
+        latest_user_text: str,
+        latest_assistant_text: str,
+        transcript: List[Dict[str, Any]],
+    ) -> None:
+        cfg = self._conversation_followup_config()
+        if not cfg or not cfg.enabled:
+            return
+
+        classification = self._classify_conversation_followup(
+            source=source,
+            latest_user_text=latest_user_text,
+            latest_assistant_text=latest_assistant_text,
+            transcript=transcript,
+        )
+        if not classification:
+            self.session_store.clear_followup(session_entry.session_key)
+            return
+
+        now = datetime.now()
+        due_at = now + timedelta(minutes=self._conversation_followup_delay_minutes(classification["reason"]))
+        if session_entry.followup_sent_at:
+            minimum_due = session_entry.followup_sent_at + timedelta(minutes=max(1, int(cfg.min_minutes_between_followups)))
+            if minimum_due > due_at:
+                due_at = minimum_due
+
+        self.session_store.schedule_followup(
+            session_entry.session_key,
+            reason=classification["reason"],
+            due_at=due_at,
+            context=classification.get("context"),
+        )
+
+    async def _conversation_followup_watcher(
+        self,
+        initial_delay: int = 60,
+        _max_loops: Optional[int] = None,
+    ) -> None:
+        cfg = self._conversation_followup_config()
+        if not cfg or not cfg.enabled:
+            return
+        await asyncio.sleep(max(0, initial_delay))
+        loop_count = 0
+        while self._running:
+            try:
+                due_entries = self.session_store.get_due_followups(now=datetime.now())
+                for entry in due_entries:
+                    if entry.session_key in getattr(self, "_running_agents", {}):
+                        continue
+                    source = getattr(entry, "origin", None)
+                    if not source or not getattr(source, "chat_id", None) or not getattr(source, "platform", None):
+                        self.session_store.clear_followup(entry.session_key)
+                        continue
+                    adapter = self.adapters.get(source.platform)
+                    if not adapter:
+                        self.session_store.clear_followup(entry.session_key)
+                        continue
+                    transcript = self.session_store.load_transcript(entry.session_id)
+                    message = self._build_conversation_followup_message(entry, transcript)
+                    if not message:
+                        self.session_store.clear_followup(entry.session_key)
+                        continue
+                    metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
+                    await adapter.send(source.chat_id, message, metadata=metadata)
+                    self.session_store.append_to_transcript(
+                        entry.session_id,
+                        {
+                            "role": "assistant",
+                            "content": message,
+                            "timestamp": datetime.now().isoformat(),
+                            "followup_reason": entry.followup_reason,
+                            "proactive_followup": True,
+                        },
+                    )
+                    self.session_store.mark_followup_sent(entry.session_key)
+            except Exception as e:
+                logger.debug("Conversation follow-up watcher error: %s", e)
+
+            loop_count += 1
+            if _max_loops is not None and loop_count >= _max_loops:
+                return
+
+            sleep_for = max(1, int(getattr(cfg, "check_interval_seconds", 300)))
+            for _ in range(sleep_for):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -3766,6 +3970,19 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            _followup_transcript = [
+                msg for msg in (agent_messages or history or [])
+                if msg.get("role") in {"user", "assistant"}
+            ]
+            if response and message_text:
+                self._maybe_schedule_conversation_followup(
+                    source=source,
+                    session_entry=session_entry,
+                    latest_user_text=message_text,
+                    latest_assistant_text=response,
+                    transcript=_followup_transcript,
+                )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))

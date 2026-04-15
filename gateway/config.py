@@ -218,6 +218,61 @@ class StreamingConfig:
 
 
 @dataclass
+class ConversationFollowupConfig:
+    """Configuration for proactive conversation follow-ups in DM-style chats."""
+    enabled: bool = False
+    only_dms: bool = True
+    check_interval_seconds: int = 300
+    min_minutes_between_followups: int = 720
+    question_min_delay_minutes: int = 180
+    question_max_delay_minutes: int = 360
+    emotional_min_delay_minutes: int = 240
+    emotional_max_delay_minutes: int = 720
+    task_min_delay_minutes: int = 360
+    task_max_delay_minutes: int = 720
+    checkout_min_delay_minutes: int = 1440
+    checkout_max_delay_minutes: int = 2880
+    min_turns_for_checkout: int = 4
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "only_dms": self.only_dms,
+            "check_interval_seconds": self.check_interval_seconds,
+            "min_minutes_between_followups": self.min_minutes_between_followups,
+            "question_min_delay_minutes": self.question_min_delay_minutes,
+            "question_max_delay_minutes": self.question_max_delay_minutes,
+            "emotional_min_delay_minutes": self.emotional_min_delay_minutes,
+            "emotional_max_delay_minutes": self.emotional_max_delay_minutes,
+            "task_min_delay_minutes": self.task_min_delay_minutes,
+            "task_max_delay_minutes": self.task_max_delay_minutes,
+            "checkout_min_delay_minutes": self.checkout_min_delay_minutes,
+            "checkout_max_delay_minutes": self.checkout_max_delay_minutes,
+            "min_turns_for_checkout": self.min_turns_for_checkout,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConversationFollowupConfig":
+        if not data:
+            return cls()
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            only_dms=_coerce_bool(data.get("only_dms"), True),
+            check_interval_seconds=int(data.get("check_interval_seconds", 300)),
+            min_minutes_between_followups=int(data.get("min_minutes_between_followups", 720)),
+            question_min_delay_minutes=int(data.get("question_min_delay_minutes", 180)),
+            question_max_delay_minutes=int(data.get("question_max_delay_minutes", 360)),
+            emotional_min_delay_minutes=int(data.get("emotional_min_delay_minutes", 240)),
+            emotional_max_delay_minutes=int(data.get("emotional_max_delay_minutes", 720)),
+            task_min_delay_minutes=int(data.get("task_min_delay_minutes", 360)),
+            task_max_delay_minutes=int(data.get("task_max_delay_minutes", 720)),
+            checkout_min_delay_minutes=int(data.get("checkout_min_delay_minutes", 1440)),
+            checkout_max_delay_minutes=int(data.get("checkout_max_delay_minutes", 2880)),
+            min_turns_for_checkout=int(data.get("min_turns_for_checkout", 4)),
+        )
+
+
+@dataclass
 class GatewayConfig:
     """
     Main gateway configuration.
@@ -256,6 +311,9 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Proactive conversation follow-ups
+    conversation_followups: ConversationFollowupConfig = field(default_factory=ConversationFollowupConfig)
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -353,6 +411,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "conversation_followups": self.conversation_followups.to_dict(),
         }
     
     @classmethod
@@ -414,6 +473,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            conversation_followups=ConversationFollowupConfig.from_dict(data.get("conversation_followups", {})),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -493,6 +553,10 @@ def load_gateway_config() -> GatewayConfig:
             streaming_cfg = yaml_cfg.get("streaming")
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            conversation_followups_cfg = yaml_cfg.get("conversation_followups")
+            if isinstance(conversation_followups_cfg, dict):
+                gw_data["conversation_followups"] = conversation_followups_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
